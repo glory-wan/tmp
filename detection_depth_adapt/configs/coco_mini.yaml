@@ -1,0 +1,80 @@
+seed: 17
+workspace: outputs/detection_depth_adapt/exp_3classes
+
+closed_loop:
+  rounds: 3
+  warmup_epochs: 70
+  finetune_epochs: 10
+  synthetic_images_per_round: 500
+
+# 关闭 subset 跑完整类别
+class_subset:
+  enabled: true
+  count: 3
+  class_ids: [14, 25, 53]  # e.g. [0, 2, 16]; takes precedence over count when set
+
+label_scope:
+  # full: train/eval real labels use all 80 COCO classes, while mining,
+  # prompt optimization and bbox editing still use class_subset.
+  # subset: previous quick-test behavior; train/eval labels also use class_subset.
+  train_eval: full
+
+data:
+  train_annotations: data/coco/annotations/instances_minitrain2017.json
+  train_images: data/coco/images/train2017
+  val_annotations: data/coco/annotations/instances_val2017.json
+  val_images: data/coco/images/val2017
+
+yolov7:
+  repo: external/yolov7
+  weights: weights/yolov7.pt
+  device: "0"
+  image_size: 640
+
+stable_diffusion:
+  model: /data/zwq/models/stable-diffusion-inpainting
+  local_files_only: true
+
+mining:
+  max_images: 1000
+  conf: 0.001
+  match_iou: 0.50
+  low_confidence: 0.25
+  ambiguous_gap: 0.08
+  forgotten_threshold: 1
+
+prompt_optimization:
+  prompt_scope: class  # class or class_failure
+  include_class_name: true #总prompt里会加入类别提示
+  num_new_tokens: 4
+  initializer_token: object
+  init_mode: mean_emb_cov_emb
+  resume_from_previous: true
+  resume_mode: overwrite  # overwrite or reinit
+  resolution: 512
+  max_train_steps: 1000
+  save_steps: 100
+  log_every: 10
+  learning_rate: 0.0005
+  strength: 0.65
+  num_inference_steps: 5
+  semantic_weight: 1.0
+  detector_weight: 0.1
+
+generation:
+  device: cuda:0
+  include_class_name: null  # null: inherit optimized prompt metadata; true/false: override
+  max_images: 500
+  max_objects_per_image: 20
+  mask_padding: 0.08
+  strength: 0.65
+  guidance_scale: 7.5
+  num_inference_steps: 30
+
+finetune:
+  workers: 8
+  batch_size: 16
+  epochs: 10
+
+evaluation:
+  batch_size: 16
