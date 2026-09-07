@@ -1,0 +1,31 @@
+data:
+  train_annotations: data/coco/annotations/instances_minitrain2017.json
+  train_images: data/coco/images/train2017
+
+instance_quality:
+  annotations: data/coco/annotations/instances_minitrain2017.json
+  images: data/coco/images/train2017
+  # Optional. Accepts a SAM/SAM3 JSON file or a directory of mask images named by COCO annotation id.
+  # sam_masks: outputs/sam3/coco_minitrain_masks
+  output_dir: outputs/instance_quality/coco_mini_3classes
+  class_ids: [14, 25, 53]
+  max_instances: 500
+  thumb_size: 520 #HTML缩略图大小
+  write_filtered_annotations: true
+
+  # Put manually judged invalid annotation ids here while tuning thresholds.
+  # JSON format can be either [123, 456] or {"annotation_ids": [123, 456]}.
+  # manual_invalid: outputs/instance_quality/manual_invalid_annotation_ids.json
+
+  rules:
+    min_mask_area_px: 1
+    min_mask_area_ratio: 0.0008
+    min_bbox_width_px: 1
+    min_bbox_height_px: 1
+    min_bbox_area_px: 1
+    min_bbox_area_ratio: 0.0010
+    min_mask_bbox_fill_ratio: 0.1  #mask和bbox匹配程度
+    # Set this only if very large objects should also be filtered.
+    # max_bbox_area_ratio: 0.85
+    # Used for the HTML "Large" button only.
+    large_bbox_area_ratio: 0.20

@@ -1,0 +1,108 @@
+seed: 23
+workspace: outputs/detection_gligen_sdedit/exp_0807_30class_renew
+
+closed_loop:
+  rounds: 2
+  skip_warmup: true
+  warmup_weights: outputs/cocofromgr/epoch_300.pt
+  warmup_epochs: 300
+  finetune_epochs: 15
+  synthetic_images_per_round: 5000  #实际有用的
+
+class_subset:
+  enabled: true
+  count: 30
+  # class_ids: [14, 25, 53]
+  class_ids: null
+
+label_scope:
+  # full: train/eval real labels use all 80 COCO classes, while mining,
+  # prompt optimization and bbox editing still use class_subset.
+  # subset: previous quick-test behavior; train/eval labels also use class_subset.
+  train_eval: full
+
+data:
+  train_annotations: data/coco/annotations/instances_minitrain2017.json
+  train_images: data/coco/images/train2017
+  val_annotations: data/coco/annotations/instances_val2017.json
+  val_images: data/coco/images/val2017
+
+yolov7:
+  repo: external/yolov7
+  weights: weights/yolov7.pt
+  device: "0"
+  image_size: 640
+
+stable_diffusion:
+  model: /data/model/models_zwq/stable-diffusion-inpainting
+  local_files_only: true
+
+mining:
+  max_images: 20000
+  min_failures_per_class: 60
+  #默认不设置时，仍保持原来的随机抽取 max_images 张图
+  #所有目标类别达到阈值后提前停止,否则继续到数据集结束或 max_images 上限
+
+
+  conf: 0.001
+  match_iou: 0.50
+  low_confidence: 0.25
+  ambiguous_gap: 0.08
+  forgotten_threshold: 1
+
+prompt_optimization:
+  prompt_scope: class
+  include_class_name: true  #要不要在prompt里加classname
+  num_new_tokens: 4
+  initializer_token: object
+  # initializer_token, mean_emb_cov_emb, or class_name
+  init_mode: class_name
+  resume_from_previous: true
+  resume_mode: overwrite
+  resolution: 512
+  max_train_steps: 10000
+  save_steps: 2000
+  log_every: 1000
+  learning_rate: 0.0005
+  strength: 0.65
+  num_inference_steps: 5
+  semantic_weight: 1.0
+  class_semantic_weight: 0.6
+  class_semantic_model: /data/model/models_zwq/clip-vit-large-patch14
+  class_semantic_local_files_only: true
+  detector_weight: 0.05
+  instance_quality_filter:
+    enabled: true 
+    config: detection_gligen_sdedit/configs/instance_quality_coco_mini.yaml
+    # Optional direct override. If null, config.instance_quality.output_dir/instances_quality.json is used.
+    results: null
+
+generation:
+  model: /data/model/models_zwq/gligen/diffusers-generation-text-box
+  variant: null
+  local_files_only: true
+  device: cuda:0
+  include_class_name: null  #会按训练 prompt 时的设置来生成
+  max_images: 5000
+  max_objects_per_image: 6
+  width: 512
+  height: 512
+  strength: 0.65
+  noise_timestep: null
+  guidance_scale: 7.5
+  num_inference_steps: 30
+  gligen_scheduled_sampling_beta: 0.5
+  global_prompt_source: category_count  # template, category_count, or empty
+  global_prompt_template: "{phrases}, photo, highly detailed, photorealistic"
+  enable_generation_filter: true
+  min_bbox_area_ratio: 0.01
+  save_visualization: false
+
+finetune:
+  workers: 8
+  batch_size: 16
+  epochs: 15
+  save_every_epochs: 5
+
+evaluation:
+  batch_size: 16

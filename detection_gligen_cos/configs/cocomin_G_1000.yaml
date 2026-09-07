@@ -1,0 +1,144 @@
+# Complete configuration for detection_gligen_sdedit.retrain_runner.
+# CLI values override baseline, model_yaml, dataset, rounds, syn_sample, and
+# device. The complete effective configuration is embedded in the state JSON.
+
+baseline: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/yolo26n_COCO_min_cos_no_patience/min_G_100_baseline/weights/best.pt
+model_yaml: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/ultralytics/cfg/models/26/yolo26n.yaml
+dataset: /home/suhu/data/wgr/datasets/coco/coco.yaml
+rounds: 50
+syn_sample: 1000
+device: "6"
+
+seed: 46
+workspace: outputs/yolo26n_COCO_min_cos_no_patience
+
+
+# model.data already defines the complete three-class model space.
+class_subset:
+  enabled: false
+
+label_scope:
+  train_eval: full
+
+data:
+  train_annotations: /home/suhu/data/wgr/datasets/coco/annotation/instances_train2017.json
+  train_images: /home/suhu/data/wgr/datasets/coco/images/train2017
+  val_annotations: /home/suhu/data/wgr/datasets/coco/annotation/instances_val2017.json
+  val_images: /home/suhu/data/wgr/datasets/coco/images/val2017
+
+model:
+  backend: ultralytics
+  family: yolo
+  task: detect
+  ultralytics_root: ultralytics
+  weights: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/yolo26n_COCO_min_cos_no_patience/min_G_100_baseline/weights/best.pt
+  data: /home/suhu/data/wgr/datasets/coco/coco.yaml
+  device: "0"
+  image_size: 640
+  inference:
+    iou: 0.70
+    max_det: 300
+
+# Used by differentiable prompt optimization. Final synthetic generation uses
+# the GLIGEN model configured in generation.model.
+stable_diffusion:
+  model: /home/suhu/data/wgr/code/prompt_stepbys/SDI
+  local_files_only: true
+
+mining:
+  max_images: 20000
+  min_failures_per_class: 50
+  conf: 0.001
+  match_iou: 0.50
+  low_confidence: 0.25
+  ambiguous_gap: 0.08
+  forgotten_threshold: 1
+
+prompt_optimization:
+  prompt_scope: class
+  include_class_name: true
+  num_new_tokens: 4
+  initializer_token: object
+  init_mode: class_name
+  resume_from_previous: true
+  resume_mode: overwrite
+  resolution: 512
+  max_train_steps: 1000
+  save_steps: 100
+  log_every: 10
+  learning_rate: 0.0005
+  strength: 0.65
+  num_inference_steps: 5
+  semantic_weight: 1.0
+  class_semantic_weight: 0.0
+  class_semantic_model: /home/suhu/data/model/models_zwq/clip-vit-large-patch14
+  class_semantic_local_files_only: true
+  detector_weight: 0.1
+  instance_quality_filter:
+    enabled: false
+    config: detection_gligen_sdedit/configs/instance_quality_coco_mini.yaml
+    results: null
+
+# Branch-specific full-image GLIGEN + SDEdit generation.
+generation:
+  model: /data/model/models_zwq/gligen/diffusers-generation-text-box
+  variant: null
+  local_files_only: true
+  device: cuda:0
+  include_class_name: null
+  max_images: 2000
+  max_objects_per_image: 20
+  width: 512
+  height: 512
+  strength: 0.65
+  noise_timestep: null
+  guidance_scale: 7.5
+  num_inference_steps: 30
+  gligen_scheduled_sampling_beta: 0.3
+  global_prompt_source: template
+  global_prompt_template: "{phrases}, photo, highly detailed, photorealistic"
+  negative_prompt: "wrong class, duplicate object, deformed, cropped, text, watermark"
+  enable_generation_filter: false
+  min_bbox_area_ratio: 0.001
+  save_visualization: false
+
+# Settings for build_coco_cos_subsets_ultralytics.py.
+gradient_alignment:
+  script: /home/suhu/data/wgr/code/prompt_stepbys/build_coco_cos_subsets_ultralytics.py
+  score_dir_name: gradient_scores_gligen_sdedit_ultralytics_val
+  task: detect
+  image_size: 640
+  scaleup: false
+  guide_batch_size: 8
+  workers: 4
+  copy_workers: 8
+  # These branch-specific names avoid collisions with ROI-inpainting runs that
+  # use the same original dataset.
+  positive_name_template: gligen_200_round_{round}_train_cos_more_0
+  negative_name_template: gligen_200_round_{round}_train_cos_less_0
+  zero_name_template: gligen_200_round_{round}_train_cos_equal_0
+
+# Each group is initialized from model_yaml, never baseline/previous weights.
+retrain:
+  epochs: 500
+  image_size: 640
+  batch_size: 156
+  # Physical GPU IDs used only by retraining. Use a comma-separated value such as "6,7" for multi-GPU DDP.
+  device: "6"
+  project: yolo26n_COCO_min_cos_no_patience
+  patience: 0
+  workers: 24
+  exist_ok: true
+  close_mosaic: 10
+  seed: 42
+
+# Retained from the source branch configuration for a self-contained YAML.
+finetune:
+  workers: 8
+  batch_size: 16
+  epochs: 10
+  save_every_epochs: null
+
+evaluation:
+  workers: 8
+  batch_size: 16

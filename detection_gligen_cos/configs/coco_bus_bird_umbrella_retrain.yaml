@@ -1,0 +1,154 @@
+# Complete configuration for detection_gligen_cos.retrain_runner schema 2.
+# CLI values override baseline, model_yaml, dataset, rounds, syn_sample, and
+# device. The complete effective configuration is embedded in the state JSON.
+
+baseline: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/runs/detect/yolo26n_COCO_subset/bus_bird_umbrella/weights/best.pt
+model_yaml: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/ultralytics/cfg/models/26/yolo26n.yaml
+dataset: /home/suhu/data/wgr/datasets/coco_bus_bird_umbrella/coco_subset.yaml
+rounds: 10
+syn_sample: 2000
+device: "6"
+
+seed: 46
+workspace: outputs/bus_bird_umbrella_gligen_cos_prompt_retrain_loop
+
+closed_loop:
+  rounds: 10
+  skip_warmup: true
+  warmup_weights: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/runs/detect/yolo26n_COCO_subset/bus_bird_umbrella/weights/best.pt
+  warmup_epochs: 0
+  finetune_epochs: 10
+  synthetic_images_per_round: 2000
+
+# model.data already defines the complete three-class model space.
+class_subset:
+  enabled: false
+
+label_scope:
+  train_eval: full
+
+data:
+  train_annotations: /home/suhu/data/wgr/datasets/coco_bus_bird_umbrella/annotation/instances_train2017.json
+  train_images: /home/suhu/data/wgr/datasets/coco_bus_bird_umbrella/images/train2017
+  val_annotations: /home/suhu/data/wgr/datasets/coco_bus_bird_umbrella/annotation/instances_val2017.json
+  val_images: /home/suhu/data/wgr/datasets/coco_bus_bird_umbrella/images/val2017
+
+model:
+  backend: ultralytics
+  family: yolo
+  task: detect
+  ultralytics_root: ultralytics
+  weights: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/runs/detect/yolo26n_COCO_subset/bus_bird_umbrella/weights/best.pt
+  data: /home/suhu/data/wgr/datasets/coco_bus_bird_umbrella/coco_subset.yaml
+  device: "0"
+  image_size: 640
+  inference:
+    iou: 0.70
+    max_det: 300
+
+# Used by differentiable prompt optimization. Final synthetic generation uses
+# the GLIGEN model configured in generation.model.
+stable_diffusion:
+  model: /home/suhu/data/wgr/code/prompt_stepbys/SDI
+  local_files_only: true
+
+mining:
+  max_images: 20000
+  min_failures_per_class: 50
+  conf: 0.001
+  match_iou: 0.50
+  low_confidence: 0.25
+  ambiguous_gap: 0.08
+  forgotten_threshold: 1
+
+prompt_optimization:
+  prompt_scope: class
+  include_class_name: true
+  num_new_tokens: 4
+  initializer_token: object
+  init_mode: class_name
+  resume_from_previous: true
+  resume_mode: overwrite
+  resolution: 512
+  max_train_steps: 1000
+  save_steps: 100
+  log_every: 10
+  learning_rate: 0.0005
+  strength: 0.65
+  num_inference_steps: 5
+  semantic_weight: 1.0
+  class_semantic_weight: 0.0
+  class_semantic_model: /home/suhu/data/model/models_zwq/clip-vit-large-patch14
+  class_semantic_local_files_only: true
+  detector_weight: 0.1
+  gradient_alignment:
+    enabled: true
+    guide_root: null
+    guide_split: val
+    task: detect
+    parameter_scope: detection_head
+    image_size: 640
+    scaleup: false
+    guide_batch_size: 8
+    workers: 4
+    max_guide_images: null
+    target_scope: full_layout
+    loss: hinge
+    weight: 1.0
+    margin: 0.0
+    warmup_steps: 100
+    epsilon: 1.0e-12
+    implementation: exact
+    cache: true
+    max_objects_per_image: 20
+    enable_layout_filter: false
+    min_bbox_area_ratio: 0.001
+  instance_quality_filter:
+    enabled: false
+    config: detection_gligen_cos/configs/instance_quality_coco_mini.yaml
+    results: null
+
+# Full-image GLIGEN + SDEdit generation.
+generation:
+  model: /data/model/models_zwq/gligen/diffusers-generation-text-box
+  variant: null
+  local_files_only: true
+  device: cuda:0
+  include_class_name: null
+  max_images: 2000
+  max_objects_per_image: 20
+  width: 512
+  height: 512
+  strength: 0.65
+  noise_timestep: null
+  guidance_scale: 7.5
+  num_inference_steps: 30
+  gligen_scheduled_sampling_beta: 0.3
+  global_prompt_source: template
+  global_prompt_template: "{phrases}, photo, highly detailed, photorealistic"
+  negative_prompt: "wrong class, duplicate object, deformed, cropped, text, watermark"
+  enable_generation_filter: false
+  min_bbox_area_ratio: 0.001
+  save_visualization: false
+
+# The single retrain run is initialized from model_yaml, never baseline/previous weights.
+retrain:
+  epochs: 500
+  image_size: 640
+  batch_size: 78
+  project: yolo26n_COCO_subset_gligen_cos_prompt
+  run_name_template: round_{round}_cos_prompt
+  patience: 10
+  workers: 24
+  exist_ok: true
+
+# Retained from the source branch configuration for a self-contained YAML.
+finetune:
+  workers: 8
+  batch_size: 16
+  epochs: 10
+  save_every_epochs: null
+
+evaluation:
+  workers: 8
+  batch_size: 16

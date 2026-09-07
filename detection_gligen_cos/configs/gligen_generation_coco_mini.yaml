@@ -1,0 +1,31 @@
+# seed: 23
+seed: 13
+
+class_subset:
+  enabled: true
+  class_ids: [14, 25, 53]
+
+data:
+  train_annotations: data/coco/annotations/instances_minitrain2017.json
+  train_images: data/coco/images/train2017
+
+gligen_generation:
+  # Official GLIGEN text+box generation checkpoint converted for diffusers.
+  model: /data/model/models_zwq/gligen/diffusers-generation-text-box
+  variant: fp16
+  local_files_only: true
+  tokens_dir: outputs/detection_gligen_sdedit/exp_0728/round_1/prompts
+  output_dir: outputs/detection_gligen_sdedit/gligen_generation/round_1
+  prompt_scope: class
+  include_class_name: null
+  max_images: 500
+  max_objects_per_image: 8
+  width: 512
+  height: 512
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  gligen_scheduled_sampling_beta: 0.3
+  global_prompt_template: "{phrases}, photo, highly detailed, photorealistic"
+  negative_prompt: "wrong class, duplicate object, deformed, cropped, text, watermark"
+  device: cuda:0
+  clean_output: true
