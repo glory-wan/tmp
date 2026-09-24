@@ -131,7 +131,7 @@ cos_warmup_steps: max_train_steps 的前 10%
 1. **参数范围**：按固定顺序使用最后检测头的全部 `named_parameters()`。当前三类 YOLO26n 检查点对应 132 个参数张量、
    242346 个参数；具体数量仍应从实际模型读取和校验，不能写死。
 2. **检测损失**：使用当前模型的原生 Ultralytics detection loss；第一阶段只支持本实验实际使用的 YOLO detect。
-3. **Guide 集**：使用数据集 `val` 的图像与 YOLO 标签，计算全局平均参考梯度。
+3. **Guide 集**：使用必填 `guideset_yaml` 指向的 `guideset_path/images` 和 `guideset_path/labels`，且 names 必须与训练数据集完全一致，计算全局平均参考梯度。
 4. **图像预处理**：复现旧脚本的 letterbox、114 padding、round 规则和 `scaleup` 行为。
 5. **框变换**：letterbox 后同步变换归一化框，不能只变换图像。
 6. **数值精度**：检测器、Guide 梯度和余弦计算使用 FP32；Guide 梯度作为 detached tensor 缓存。
@@ -333,8 +333,7 @@ prompt_optimization:
 
   gradient_alignment:
     enabled: true
-    guide_root: null          # null 表示使用 dataset YAML 解析出的数据集根目录
-    guide_split: val
+    guideset_yaml: /absolute/path/to/my_guide_set.yaml  # 必填，包含 guideset_path 和 names
     task: detect
     parameter_scope: detection_head
     image_size: 640

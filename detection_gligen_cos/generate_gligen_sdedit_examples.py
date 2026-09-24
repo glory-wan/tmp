@@ -619,8 +619,8 @@ def main() -> None:
             item["result_overlay_file"] = str(result_overlay.relative_to(output))
         manifest.append(item)
         completed_image_ids.add(int(image_id))
-        write_json_atomic(manifest_path, manifest)
-        write_json_atomic(selected_images_path, selected_images)
+        # write_json_atomic(manifest_path, manifest)
+        # write_json_atomic(selected_images_path, selected_images)
         update_resume_state(
             Path(args.state_json) if args.state_json else None,
             len(manifest),

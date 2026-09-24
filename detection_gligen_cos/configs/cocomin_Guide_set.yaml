@@ -2,15 +2,15 @@
 # CLI values override baseline, model_yaml, dataset, rounds, syn_sample, and
 # device. The complete effective configuration is embedded in the state JSON.
 
-baseline: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/yolo26n_coco_01_no_patience/baseline/weights/best.pt
+baseline: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/yolo26n_COCOmin_350_epochs/baseline/weights/best.pt
 model_yaml: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/ultralytics/cfg/models/26/yolo26n.yaml
 dataset: /home/suhu/data/wgr/datasets/cocomin/cocomin.yaml
-rounds: 50
+rounds: 20
 syn_sample: 11714
 device: "6"
 
 seed: 46
-workspace: outputs/yolo26n_COCO_min_cos_no_patience
+workspace: outputs/yolo26n_COCOmin_guide
 
 
 # model.data already defines the complete three-class model space.
@@ -31,7 +31,7 @@ model:
   family: yolo
   task: detect
   ultralytics_root: ultralytics
-  weights: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/yolo26n_coco_01_no_patience/baseline/weights/best.pt
+  weights: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/yolo26n_COCOmin_350_epochs/baseline/weights/best.pt
   data: /home/suhu/data/wgr/datasets/cocomin/cocomin.yaml
   device: "0"
   image_size: 640
@@ -126,7 +126,7 @@ retrain:
   batch_size: 156
   # Physical GPU IDs used only by retraining. Use a comma-separated value such as "6,7" for multi-GPU DDP.
   device: "6"
-  project: yolo26n_coco_01_no_patience
+  project: /home/suhu/data/wgr/code/prompt_stepbys/ultralytics/yolo26n_COCOmin_350_epochs
   patience: 0
   workers: 24
   exist_ok: true

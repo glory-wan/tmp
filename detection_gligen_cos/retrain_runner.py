@@ -213,8 +213,7 @@ def normalize_effective_config(
     optimization = cfg.setdefault("prompt_optimization", {})
     gradient = optimization.setdefault("gradient_alignment", {})
     gradient.setdefault("enabled", True)
-    gradient.setdefault("guide_root", None)
-    gradient.setdefault("guide_split", "val")
+    gradient.setdefault("guideset_yaml", cfg.get("gradient_alignment", {}).get("guideset_yaml"))
     gradient.setdefault("task", "detect")
     gradient.setdefault("parameter_scope", "detection_head")
     gradient.setdefault("image_size", int(model_cfg["image_size"]))
@@ -235,8 +234,7 @@ def normalize_effective_config(
     gradient.setdefault("max_objects_per_image", generation["max_objects_per_image"])
     gradient.setdefault("enable_layout_filter", generation["enable_generation_filter"])
     gradient.setdefault("min_bbox_area_ratio", generation["min_bbox_area_ratio"])
-    # V1 stored post-generation splitting options at the top level. They have no
-    # meaning in schema 2 and must not leak into the effective configuration.
+    # Preserve guideset_yaml above; discard legacy post-generation splitting options.
     cfg.pop("gradient_alignment", None)
 
     retrain = cfg.setdefault("retrain", {})
@@ -253,6 +251,7 @@ def normalize_effective_config(
 
 
 def validate_effective_config(cfg: dict[str, Any]) -> None:
+    guide_images, guide_labels = guide_data_paths(cfg)
     baseline = Path(cfg["baseline"])
     dataset_yaml = Path(cfg["dataset"])
     ultralytics_root = Path(cfg["model"]["ultralytics_root"])
@@ -309,15 +308,6 @@ def validate_effective_config(cfg: dict[str, Any]) -> None:
     if gradient.get("enabled", True):
         if cfg["model"]["family"] != "yolo" or cfg["model"]["task"] != "detect":
             raise ValueError("Exact Prompt gradient alignment currently supports YOLO detect only")
-        guide_root = (
-            resolved(gradient["guide_root"], dataset_yaml.parent)
-            if gradient.get("guide_root")
-            else dataset_root
-        )
-        if gradient["guide_split"] != "val":
-            raise ValueError("Prompt gradient alignment currently requires guide_split=val")
-        guide_images = guide_root / "images/val2017"
-        guide_labels = guide_root / "labels/val2017"
         require_directory(guide_images, "Guide images")
         require_directory(guide_labels, "Guide labels")
         if not any(path.is_file() for path in guide_images.iterdir()):
@@ -487,16 +477,24 @@ def data_paths(cfg: dict[str, Any]) -> dict[str, Path]:
 
 
 def guide_data_paths(cfg: dict[str, Any]) -> tuple[Path, Path]:
-    paths = data_paths(cfg)
-    gradient = cfg["prompt_optimization"]["gradient_alignment"]
-    guide_root = (
-        resolved(gradient["guide_root"], paths["dataset_yaml"].parent)
-        if gradient.get("guide_root")
-        else paths["root"]
-    )
-    if gradient.get("guide_split", "val") != "val":
-        raise ValueError("Prompt gradient alignment currently requires guide_split=val")
-    return guide_root / "images/val2017", guide_root / "labels/val2017"
+    from .common import load_dataset_yaml_names
+
+    gradient = cfg.get("prompt_optimization", {}).get("gradient_alignment", {})
+    value = gradient.get("guideset_yaml") or cfg.get("gradient_alignment", {}).get("guideset_yaml")
+    if not value:
+        raise ValueError("必须指定 guide set 的 YAML 文件：gradient_alignment.guideset_yaml")
+    guide_yaml = resolved(value)
+    require_file(guide_yaml, "Guide set YAML")
+    payload = yaml.safe_load(guide_yaml.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not payload.get("guideset_path"):
+        raise ValueError(f"Guide set YAML must define guideset_path: {guide_yaml}")
+    if load_dataset_yaml_names(guide_yaml) != load_dataset_yaml_names(cfg["dataset"]):
+        raise ValueError(
+            f"Guide set YAML names must exactly match training dataset names "
+            f"(class ids, order and spelling): {guide_yaml} != {cfg['dataset']}"
+        )
+    guide_root = resolved(payload["guideset_path"], guide_yaml.parent)
+    return guide_root / "images", guide_root / "labels"
 
 
 def ensure_missing_labels(cfg: dict[str, Any]) -> None:

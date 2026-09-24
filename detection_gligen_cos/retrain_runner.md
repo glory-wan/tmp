@@ -51,8 +51,7 @@ baseline / 上一轮 cos_prompt best.pt
 ```yaml
 gradient_alignment:
   enabled: true
-  guide_root: null
-  guide_split: val
+  guideset_yaml: /home/suhu/data/wgr/datasets/coco_guideset/guideset.yaml
   task: detect
   parameter_scope: detection_head
   image_size: 640
@@ -88,8 +87,29 @@ L = semantic_weight * L_semantic
 完整 layout target。`effective_cos_weight` 在 `warmup_steps` 内从 0 线性增加到
 `weight`。实现使用 `create_graph=True` 的精确二阶梯度，不会静默降级。
 
-Guide 图像默认来自数据集根目录的 `images/val2017`，标签来自
-`labels/val2017`；YOLO 分割多边形标签会按旧筛选脚本的规则转换为外接框。
+必须指定 `guideset_yaml`，不再默认使用原始数据集 val，也不再使用 `guide_root` / `guide_split`。
+可像 `configs/cocomin_G_1000.yaml` 一样在顶层配置：
+
+```yaml
+gradient_alignment:
+  guideset_yaml: /absolute/path/to/my_guide_set.yaml
+```
+
+也支持 `prompt_optimization.gradient_alignment.guideset_yaml`；同时指定时嵌套字段优先。
+Guide YAML 示例：
+
+```yaml
+guideset_path: /absolute/path/to/my_guide_set
+names: [umbrella, bird, bus]  # 必须与训练数据集的 names 完全一致
+```
+
+`names` 支持列表或从 0 连续编号的字典，按类别 ID 比较数量、顺序和名称（区分大小写）。
+缺少 Guide YAML、文件不存在、缺少 `guideset_path` 或 names 不匹配时会报错。
+Guide YAML 的相对路径基于仓库根目录；`guideset_path` 的相对路径基于 Guide YAML 所在目录。
+图像读取 `<guideset_path>/images/`，标签读取 `<guideset_path>/labels/<图像stem>.txt`，不递归扫描。
+YOLO 分割多边形标签仍按原规则转换为外接框，其他优化参数保持不变。
+通过 `--state-json` 恢复时使用状态中保存的配置，旧状态也必须补充上述字段；
+更换 Guide 后不能继续使用 metadata 不一致的 Prompt checkpoint，应启动新的 workspace。
 每轮缓存位于：
 
 ```text

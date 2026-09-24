@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import tempfile
 import unittest
@@ -33,10 +34,49 @@ class RetrainRunnerTest(unittest.TestCase):
             "names: [umbrella, bird, bus]\n",
             encoding="utf-8",
         )
+        self.guide_root = self.root / "guide"
+        (self.guide_root / "images").mkdir(parents=True)
+        (self.guide_root / "labels").mkdir()
+        self.guide_yaml = self.root / "guide.yaml"
+        self.guide_yaml.write_text(
+            "guideset_path: guide\nnames: {0: umbrella, 1: bird, 2: bus}\n",
+            encoding="utf-8",
+        )
         self.workspace = self.root / "workspace"
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_guideset_paths_and_top_level_normalization(self):
+        raw = {"baseline": "model.pt", "dataset": str(self.dataset_yaml),
+               "gradient_alignment": {"guideset_yaml": str(self.guide_yaml)}}
+        args = argparse.Namespace(baseline=None, dataset=None, model_yaml=None,
+                                  rounds=None, syn_sample=None, device=None)
+        cfg = runner.normalize_effective_config(raw, args, self.root / "overall.yaml")
+        self.assertEqual(runner.guide_data_paths(cfg),
+                         (self.guide_root / "images", self.guide_root / "labels"))
+        self.assertEqual(cfg["prompt_optimization"]["gradient_alignment"]["guideset_yaml"],
+                         str(self.guide_yaml))
+
+    def test_guideset_is_required(self):
+        with self.assertRaisesRegex(ValueError, "必须指定.*YAML"):
+            runner.validate_effective_config({"dataset": str(self.dataset_yaml)})
+
+    def test_guideset_rejects_invalid_yaml_or_names(self):
+        cfg = {"dataset": str(self.dataset_yaml),
+               "gradient_alignment": {"guideset_yaml": str(self.guide_yaml)}}
+        for names in (["bird", "umbrella", "bus"], ["umbrella", "bird"],
+                      ["Umbrella", "bird", "bus"]):
+            with self.subTest(names=names):
+                self.guide_yaml.write_text(yaml.safe_dump({"guideset_path": "guide", "names": names}))
+                with self.assertRaisesRegex(ValueError, "exactly match"):
+                    runner.guide_data_paths(cfg)
+        self.guide_yaml.write_text("names: [umbrella, bird, bus]\n")
+        with self.assertRaisesRegex(ValueError, "guideset_path"):
+            runner.guide_data_paths(cfg)
+        self.guide_yaml.unlink()
+        with self.assertRaisesRegex(FileNotFoundError, "Guide set YAML"):
+            runner.guide_data_paths(cfg)
 
     def test_retrain_yaml_uses_all_synthetic_rounds_once(self):
         cfg = {
@@ -199,8 +239,7 @@ class RetrainRunnerTest(unittest.TestCase):
         model.touch()
         gradient = {
             "enabled": True,
-            "guide_root": None,
-            "guide_split": "val",
+            "guideset_yaml": str(self.guide_yaml),
             "image_size": 640,
             "guide_batch_size": 2,
             "workers": 0,
