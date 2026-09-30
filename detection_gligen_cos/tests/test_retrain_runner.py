@@ -10,7 +10,7 @@ from unittest.mock import patch
 import yaml
 
 from detection_gligen_cos import retrain_runner as runner
-from detection_gligen_cos.generate_gligen_sdedit_examples import update_resume_state
+from detection_gligen_cos.generate_gligen_sdedit_examples import shard_target_count, update_resume_state
 
 
 class RetrainRunnerTest(unittest.TestCase):
@@ -108,6 +108,77 @@ class RetrainRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected 2"):
             runner.read_json(path)
 
+    def test_retrain_devices_are_normalized_and_mapped_to_logical_ids(self):
+        self.assertEqual(runner.normalize_retrain_devices("6, 7"), "6,7")
+        self.assertEqual(runner.normalize_retrain_devices([6, 7]), "6,7")
+        self.assertEqual(runner.normalize_generation_devices([0, 1, 2]), "0,1,2")
+        self.assertEqual(runner.logical_retrain_devices("6,7"), "0,1")
+        self.assertEqual(runner.logical_retrain_devices("cpu"), "cpu")
+
+
+    def test_retrain_devices_reject_duplicates_and_invalid_values(self):
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            runner.normalize_retrain_devices("6,6")
+        with self.assertRaisesRegex(ValueError, "physical GPU indices"):
+            runner.normalize_retrain_devices("cuda:6")
+
+
+    def test_retrain_environment_overrides_only_retrain_subprocess_devices(self):
+        cfg = {"device": "6", "stable_diffusion": {"local_files_only": True}}
+        stage_env = runner.subprocess_environment(cfg, quiet_stage_logs=True)
+        retrain_env = runner.subprocess_environment(
+            cfg, quiet_stage_logs=False, physical_devices="4,5"
+        )
+        self.assertEqual(stage_env["CUDA_VISIBLE_DEVICES"], "6")
+        self.assertEqual(retrain_env["CUDA_VISIBLE_DEVICES"], "4,5")
+
+
+    def test_generation_shard_targets_sum_to_global_target(self):
+        targets = [shard_target_count(1000, index, 3) for index in range(3)]
+        self.assertEqual(targets, [334, 333, 333])
+        self.assertEqual(
+            targets,
+            [runner.generation_shard_target(1000, index, 3) for index in range(3)],
+        )
+
+
+    def test_generation_shards_merge_into_canonical_output(self):
+        output = self.root / "synthetic"
+        shard_outputs = []
+        next_image_id = 1
+        for shard_index, count in enumerate((2, 2, 1)):
+            shard = output / "_shards" / f"worker_{shard_index}"
+            (shard / "images").mkdir(parents=True)
+            (shard / "labels").mkdir()
+            manifest = []
+            for _ in range(count):
+                name = f"hard_{next_image_id:012d}.jpg"
+                (shard / "images" / name).write_bytes(f"image-{next_image_id}".encode())
+                (shard / "labels" / Path(name).with_suffix(".txt")).write_text(
+                    "0 0.5 0.5 0.2 0.2\n", encoding="utf-8"
+                )
+                manifest.append(
+                    {
+                        "image_id": next_image_id,
+                        "file_name": name,
+                        "result_file": f"images/{name}",
+                    }
+                )
+                next_image_id += 1
+            (shard / "manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            shard_outputs.append(shard)
+
+        merged = runner.merge_generation_shards(output, shard_outputs, 5)
+
+        self.assertEqual(len(merged), 5)
+        self.assertEqual([item["generation_shard"] for item in merged], [0, 0, 1, 1, 2])
+        self.assertEqual(len(list((output / "images").glob("*.jpg"))), 5)
+        self.assertEqual(len(list((output / "labels").glob("*.txt"))), 5)
+        self.assertEqual(runner.manifest_count(output / "manifest.json"), 5)
+
+
     def test_generator_updates_image_level_state(self):
         state_path = self.root / "state.json"
         state = {
@@ -134,6 +205,7 @@ class RetrainRunnerTest(unittest.TestCase):
             "class_subset": {"enabled": False},
             "generation": {
                 "model": "/models/gligen",
+                "batch_size": 3,
                 "variant": None,
                 "local_files_only": True,
                 "device": "cuda:0",
@@ -164,7 +236,7 @@ class RetrainRunnerTest(unittest.TestCase):
         runner.write_json_atomic(state_path, state)
         commands: list[list[str]] = []
 
-        def fake_run(command, _cfg, quiet_stage_logs=True):
+        def fake_run(command, _cfg, quiet_stage_logs=True, **_kwargs):
             commands.append(command)
             output = self.workspace / "round_1/synthetic"
             output.mkdir(parents=True, exist_ok=True)
@@ -177,6 +249,7 @@ class RetrainRunnerTest(unittest.TestCase):
 
         command = commands[0]
         self.assertIn("detection_gligen_cos.generate_gligen_sdedit_examples", command)
+        self.assertEqual(command[command.index("--batch-size") + 1], "3")
         self.assertIn("--dataset-yaml", command)
         self.assertIn("--state-json", command)
 
@@ -200,9 +273,10 @@ class RetrainRunnerTest(unittest.TestCase):
         cfg = {
             "dataset": str(self.dataset_yaml),
             "workspace": str(self.workspace),
-            "device": "cpu",
+            "device": "6",
             "model": {"ultralytics_root": str(self.root / "ultralytics")},
             "retrain": {
+                "device": "4,5",
                 "project": str(self.root / "runs"),
                 "run_name_template": "round_{round}_cos_prompt",
             },
@@ -217,9 +291,11 @@ class RetrainRunnerTest(unittest.TestCase):
         }
         runner.write_json_atomic(state_path, state)
         commands: list[list[str]] = []
+        physical_devices = []
 
-        def fake_run(command, _cfg, quiet_stage_logs=True):
+        def fake_run(command, _cfg, quiet_stage_logs=True, **_kwargs):
             commands.append(command)
+            physical_devices.append(_kwargs.get("physical_devices"))
             best = self.root / "runs/round_1_cos_prompt/weights/best.pt"
             best.parent.mkdir(parents=True, exist_ok=True)
             best.touch()
@@ -228,10 +304,13 @@ class RetrainRunnerTest(unittest.TestCase):
             runner.run_retrain(state, state_path, cfg, 1)
 
         self.assertEqual(len(commands), 1)
+        self.assertEqual(physical_devices, ["4,5"])
         self.assertIn("detection_gligen_cos.retrain_runner", commands[0])
         self.assertNotIn("--retrain-group", commands[0])
         completed = runner.read_json(state_path)["rounds"]["1"]["retrain"]
         self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["physical_devices"], "4,5")
+        self.assertEqual(completed["ultralytics_devices"], "0,1")
         self.assertNotIn("groups", completed)
 
     def test_run_optimize_invokes_cos_module_with_alignment(self):
@@ -303,7 +382,7 @@ class RetrainRunnerTest(unittest.TestCase):
         runner.write_json_atomic(state_path, state)
         commands: list[list[str]] = []
 
-        def fake_run(command, _cfg, quiet_stage_logs=True):
+        def fake_run(command, _cfg, quiet_stage_logs=True, **_kwargs):
             commands.append(command)
             prompts = self.workspace / "round_1/prompts"
             prompts.mkdir(parents=True, exist_ok=True)

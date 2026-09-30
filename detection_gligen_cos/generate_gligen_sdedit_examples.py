@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
-import os
 import random
 import shutil
 from collections import Counter
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 
 import torch
@@ -15,6 +15,9 @@ from PIL import Image, ImageDraw
 from tqdm.auto import tqdm
 
 from .common import CocoMini, parse_class_subset, setup_logger, subset_label
+from .generation_manifest import (
+    append_record, export_manifest, initialize_journal, load_manifest, write_json_atomic,
+)
 from .generate_gligen_layout import (
     build_global_prompt,
     gligen_box_to_yolo_line,
@@ -44,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-class-name", action="store_true", default=None)
     parser.add_argument("--no-include-class-name", action="store_false", dest="include_class_name")
     parser.add_argument("--max-images", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=1, help="Images generated together on each GPU.")
     parser.add_argument("--max-objects-per-image", type=int, default=5)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=512)
@@ -60,21 +64,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--clean-output", action="store_true")
-    parser.add_argument("--resume", action="store_true", help="Continue from an atomically saved manifest.")
+    parser.add_argument("--resume", action="store_true", help="Continue from the generation journal or a legacy manifest.")
     parser.add_argument("--state-json", default=None, help="Optional retrain-runner state JSON updated after each image.")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--classes-subset", type=int, default=None)
     parser.add_argument("--class-ids", default=None)
     parser.add_argument("--save-visualization", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    return args
 
 
-def write_json_atomic(path: Path, payload) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(f"{path.suffix}.tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    os.replace(temporary, path)
+def shard_target_count(total: int, shard_index: int, num_shards: int) -> int:
+    """Return this worker's quota while distributing the remainder to low ranks."""
+
+    if total < 0:
+        raise ValueError("Generation target must be non-negative")
+    if num_shards <= 0:
+        raise ValueError("--num-shards must be positive")
+    if not 0 <= shard_index < num_shards:
+        raise ValueError("--shard-index must be in [0, --num-shards)")
+    quotient, remainder = divmod(total, num_shards)
+    return quotient + int(shard_index < remainder)
 
 
 def update_resume_state(
@@ -318,40 +331,64 @@ def scheduler_step_kwargs(pipe, generator: torch.Generator, eta: float = 0.0) ->
 @torch.no_grad()
 def run_gligen_sdedit(
     pipe,
-    source_image: Image.Image,
-    prompt: str,
+    source_image: Image.Image | list[Image.Image],
+    prompt: str | list[str],
     negative_prompt: str | None,
-    phrases: list[str],
-    boxes: list[list[float]],
+    phrases: list[str] | list[list[str]],
+    boxes: list[list[float]] | list[list[list[float]]],
     args: argparse.Namespace,
-    generator: torch.Generator,
-) -> tuple[Image.Image, dict]:
+    generator: torch.Generator | list[torch.Generator],
+) -> tuple[Image.Image | list[Image.Image], dict]:
     device = torch.device(args.device)
     do_cfg = args.guidance_scale > 1.0
+    single = isinstance(source_image, Image.Image)
+    sources = [source_image] if single else source_image
+    prompts = [prompt] if single else prompt
+    phrase_lists = [phrases] if single else phrases
+    box_lists = [boxes] if single else boxes
+    generators = [generator] if single else generator
+    batch_size = len(sources)
 
     prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
-        prompt,
+        prompts,
         device,
         num_images_per_prompt=1,
         do_classifier_free_guidance=do_cfg,
-        negative_prompt=negative_prompt,
+        negative_prompt=[negative_prompt] * batch_size if negative_prompt is not None else None,
     )
     if do_cfg:
         prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
-    image_tensor = preprocess_source_image(pipe, source_image, args.width, args.height, pipe.vae.dtype, device)
-    latents = pipe.vae.encode(image_tensor).latent_dist.sample(generator=generator)
+    image_tensor = torch.cat([
+        preprocess_source_image(pipe, source, args.width, args.height, pipe.vae.dtype, device)
+        for source in sources
+    ])
+    posterior = pipe.vae.encode(image_tensor).latent_dist
+    posterior_noise = torch.cat([
+        torch.randn((1, *posterior.mean.shape[1:]), generator=g, device=device, dtype=posterior.mean.dtype)
+        for g in generators
+    ])
+    latents = posterior.mean + posterior.std * posterior_noise
     latents = (latents * pipe.vae.config.scaling_factor).to(dtype=prompt_embeds.dtype)
     timesteps, start_index, actual_noise_timestep = select_sdedit_timesteps(
         pipe.scheduler, args.num_inference_steps, args.strength, args.noise_timestep, device
     )
-    noise = torch.randn(latents.shape, generator=generator, device=device, dtype=latents.dtype)
+    noise = torch.cat([
+        torch.randn((1, *latents.shape[1:]), generator=g, device=device, dtype=latents.dtype)
+        for g in generators
+    ])
     latents = pipe.scheduler.add_noise(latents, noise, timesteps[:1])
 
-    cross_attention_kwargs = prepare_gligen_grounding(pipe, phrases, boxes, do_cfg, device)
+    grounding = [prepare_gligen_grounding(pipe, p, b, False, device)["gligen"]
+                 for p, b in zip(phrase_lists, box_lists)]
+    grounding = {key: torch.cat([item[key] for item in grounding]) for key in grounding[0]}
+    if do_cfg:
+        grounding = {key: torch.cat([value, value]) for key, value in grounding.items()}
+        grounding["masks"][:batch_size] = 0
+    cross_attention_kwargs = {"gligen": grounding}
     num_grounding_steps = int(args.gligen_scheduled_sampling_beta * len(timesteps))
     pipe.enable_fuser(True)
-    extra_step_kwargs = scheduler_step_kwargs(pipe, generator)
+    extra_step_kwargs = scheduler_step_kwargs(pipe, generators[0] if single else generators)
 
     for step_idx, timestep in enumerate(timesteps):
         if step_idx == num_grounding_steps:
@@ -370,15 +407,31 @@ def run_gligen_sdedit(
         latents = pipe.scheduler.step(noise_pred, timestep, latents, **extra_step_kwargs).prev_sample
 
     image = pipe.vae.decode(latents / pipe.vae.config.scaling_factor, return_dict=False)[0]
-    image = pipe.image_processor.postprocess(image, output_type="pil", do_denormalize=[True])[0]
+    images = pipe.image_processor.postprocess(image, output_type="pil", do_denormalize=[True] * batch_size)
     pipe.enable_fuser(False)
-    return image, {
+    return (images[0] if single else images), {
         "strength": float(args.strength),
         "requested_noise_timestep": args.noise_timestep,
         "actual_noise_timestep": actual_noise_timestep,
         "start_timestep_index": start_index,
         "denoise_steps": len(timesteps),
     }
+
+
+
+def generate_batches(pipe, samples, args):
+    samples = iter(samples)
+    while batch := list(islice(samples, args.batch_size)):
+        images, sdedit_info = run_gligen_sdedit(
+            pipe, [item["source"] for item in batch], [item["global_prompt"] for item in batch],
+            args.negative_prompt, [item["phrases"] for item in batch], [item["boxes"] for item in batch],
+            args, [torch.Generator(device=args.device).manual_seed(args.seed + int(item["image_id"]))
+                   for item in batch],
+        )
+        if len(images) != len(batch):
+            raise RuntimeError("Generation batch returned an unexpected image count")
+        for item, image in zip(batch, images):
+            yield item, image, sdedit_info
 
 
 def draw_layout(image: Image.Image, items: list[dict]) -> Image.Image:
@@ -447,6 +500,7 @@ img {{ width: 100%; border: 1px solid #d7dee8; border-radius: 6px; display: bloc
 
 def main() -> None:
     args = parse_args()
+    local_target = shard_target_count(args.max_images, args.shard_index, args.num_shards)
     output = Path(args.output_dir)
     if args.clean_output and args.resume:
         raise ValueError("--clean-output and --resume cannot be used together")
@@ -454,7 +508,7 @@ def main() -> None:
         for child in ("images", "labels", "visuals"):
             if (output / child).exists():
                 shutil.rmtree(output / child)
-        for child in ("manifest.json", "selected_images.json", "index.html"):
+        for child in ("manifest.json", "manifest.jsonl", "progress.json", "selected_images.json", "index.html"):
             (output / child).unlink(missing_ok=True)
     logger = setup_logger(output)
     images_out = output / "images"
@@ -515,72 +569,70 @@ def main() -> None:
     install_embeddings(pipe.tokenizer, pipe.text_encoder, meta["groups"], embeddings)
 
     manifest_path = output / "manifest.json"
-    selected_images_path = output / "selected_images.json"
-    if args.resume and manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not isinstance(manifest, list):
-            raise ValueError(f"Resume manifest must be a list: {manifest_path}")
-    else:
-        manifest = []
+    manifest = load_manifest(output, repair=True) if args.resume else []
     completed_image_ids = {int(item["image_id"]) for item in manifest}
-    selected_images = [
-        str((output / item["result_file"]).resolve())
-        for item in manifest
-        if item.get("result_file")
-    ]
     candidates = [(image_id, path, anns) for image_id, path, anns in edit_dataset.iter_images(None) if anns]
     rng = random.Random(args.seed)
     selected = list(candidates)
     rng.shuffle(selected)
+    selected = selected[args.shard_index::args.num_shards]
+    assigned_image_ids = {int(image_id) for image_id, _, _ in selected}
+    invalid_completed = sorted(completed_image_ids - assigned_image_ids)
+    if invalid_completed:
+        raise ValueError(
+            f"Resume manifest contains image ids outside shard {args.shard_index}/{args.num_shards}: "
+            f"{invalid_completed[:10]}"
+        )
+    if len(manifest) > local_target:
+        raise ValueError(
+            f"Resume manifest has {len(manifest)} samples, exceeding shard target {local_target}: {manifest_path}"
+        )
+    initialize_journal(output, manifest, resume=args.resume)
+    progress_path = output / "progress.json"
+    write_json_atomic(progress_path, {"generated_samples": len(manifest), "target": local_target,
+                                      "complete": len(manifest) >= local_target})
     skipped = 0
     update_resume_state(
         Path(args.state_json) if args.state_json else None,
         len(manifest),
-        args.max_images,
-        len(manifest) >= args.max_images,
+        local_target,
+        len(manifest) >= local_target,
     )
-    for idx, (image_id, path, edit_anns) in enumerate(tqdm(selected, desc="gligen sdedit generation"), start=1):
-        if len(manifest) >= args.max_images:
-            break
-        if int(image_id) in completed_image_ids:
-            continue
-        info = full_dataset.images[int(image_id)]
-        full_anns = full_dataset.annotations.get(int(image_id), [])
-        phrases, boxes, layout_items, filtered = prepare_layout_items(
-            meta,
-            full_dataset,
-            int(image_id),
-            full_anns,
-            edit_anns,
-            prompt_scope,
-            include_class_name,
-            args.max_objects_per_image,
-            args.enable_generation_filter,
-            args.min_bbox_area_ratio,
-        )
-        if not phrases:
-            skipped += 1
-            continue
-        source = Image.open(path).convert("RGB")
-        global_prompt = choose_global_prompt(phrases, layout_items, args)
-        generator = torch.Generator(device=args.device).manual_seed(args.seed + int(image_id))
-        image, sdedit_info = run_gligen_sdedit(
-            pipe=pipe,
-            source_image=source,
-            prompt=global_prompt,
-            negative_prompt=args.negative_prompt,
-            phrases=phrases,
-            boxes=boxes,
-            args=args,
-            generator=generator,
-        )
+    def prepared_samples():
+        nonlocal skipped
+        for idx, (image_id, path, edit_anns) in enumerate(tqdm(selected, desc="gligen sdedit generation"), start=1):
+            if int(image_id) in completed_image_ids:
+                continue
+            info = full_dataset.images[int(image_id)]
+            full_anns = full_dataset.annotations.get(int(image_id), [])
+            phrases, boxes, layout_items, filtered = prepare_layout_items(
+                meta, full_dataset, int(image_id), full_anns, edit_anns,
+                prompt_scope, include_class_name, args.max_objects_per_image,
+                args.enable_generation_filter, args.min_bbox_area_ratio,
+            )
+            if not phrases:
+                skipped += 1
+                continue
+            with Image.open(path) as original:
+                source = original.convert("RGB")
+            yield dict(idx=idx, image_id=image_id, path=path, edit_anns=edit_anns,
+                       info=info, full_anns=full_anns, phrases=phrases, boxes=boxes,
+                       layout_items=layout_items, filtered=filtered, source=source,
+                       global_prompt=choose_global_prompt(phrases, layout_items, args))
+
+    pending = islice(prepared_samples(), local_target - len(manifest))
+    for sample, image, sdedit_info in generate_batches(pipe, pending, args):
+        idx, image_id, path = sample["idx"], sample["image_id"], sample["path"]
+        edit_anns, info, full_anns = sample["edit_anns"], sample["info"], sample["full_anns"]
+        phrases, boxes = sample["phrases"], sample["boxes"]
+        layout_items, filtered = sample["layout_items"], sample["filtered"]
+        source, global_prompt = sample["source"], sample["global_prompt"]
 
         name = f"hard_{int(image_id):012d}.jpg"
         result_file = images_out / name
         label_file = labels_out / Path(name).with_suffix(".txt")
         image.save(result_file, quality=95)
         write_layout_label_file(label_file, layout_items)
-        selected_images.append(str(result_file.resolve()))
 
         item = {
             "image_id": int(image_id),
@@ -617,36 +669,38 @@ def main() -> None:
             draw_result_layout(image, layout_items).save(result_overlay, quality=95)
             item["original_overlay_file"] = str(original_overlay.relative_to(output))
             item["result_overlay_file"] = str(result_overlay.relative_to(output))
+        append_record(output, item)
         manifest.append(item)
         completed_image_ids.add(int(image_id))
-        # write_json_atomic(manifest_path, manifest)
-        # write_json_atomic(selected_images_path, selected_images)
+        write_json_atomic(progress_path, {"generated_samples": len(manifest), "target": local_target,
+                                          "complete": False})
         update_resume_state(
             Path(args.state_json) if args.state_json else None,
             len(manifest),
-            args.max_images,
+            local_target,
             False,
         )
         if len(manifest) == 1 or len(manifest) % 25 == 0 or idx == len(selected):
             logger.info("generation progress: processed=%d/%d synthetic=%d skipped=%d latest=%s objects=%d",
                         idx, len(selected), len(manifest), skipped, name, len(layout_items))
 
-    write_json_atomic(manifest_path, manifest)
-    write_json_atomic(selected_images_path, selected_images)
+    export_manifest(output, manifest)
+    write_json_atomic(progress_path, {"generated_samples": len(manifest), "target": local_target,
+                                      "complete": len(manifest) >= local_target})
     update_resume_state(
         Path(args.state_json) if args.state_json else None,
         len(manifest),
-        args.max_images,
-        len(manifest) >= args.max_images,
+        local_target,
+        len(manifest) >= local_target,
     )
     if args.save_visualization:
         write_visual_index(output, manifest)
     logger.info(
         "GLIGEN SDEdit generation complete: target=%d synthetic=%d skipped=%d target_reached=%s output=%s",
-        args.max_images,
+        local_target,
         len(manifest),
         skipped,
-        len(manifest) >= args.max_images,
+        len(manifest) >= local_target,
         output,
     )
 

@@ -17,6 +17,8 @@ from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, set_seed
 from tqdm.auto import tqdm
 
+from .generate_gligen_sdedit_examples import write_json_atomic
+
 from .common import (
     CocoMini,
     add_placeholder_tokens,
@@ -49,8 +51,10 @@ def save_group_embeddings(text_encoder, tokenizer, groups, output_dir: Path, ste
             learned[token] = text_encoder.get_input_embeddings().weight[token_id].detach().cpu()
     output_dir.mkdir(parents=True, exist_ok=True)
     out = output_dir / f"learned_embeds-{step}.bin"
-    torch.save(learned, out)
-    (output_dir / "object_prompts.json").write_text(json.dumps({**metadata, "groups": groups, "latest": out.name}, indent=2), encoding="utf-8")
+    temporary = out.with_suffix(".bin.tmp")
+    torch.save(learned, temporary)
+    temporary.replace(out)
+    write_json_atomic(output_dir / "object_prompts.json", {**metadata, "groups": groups, "latest": out.name})
     return out
 
 
@@ -305,6 +309,9 @@ def main():
         "--alignment-cache", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--prepare-workers", action="store_true")
+    parser.add_argument("--train-class-ids", default=None)
+    parser.add_argument("--require-guide-cache", action="store_true")
     parser.add_argument("--prompt-scope", choices=["class", "class_failure"], default="class")
     parser.add_argument("--include-class-name", action="store_true",
                         help="Prepend the explicit COCO class name to the learned-token object prompt.")
@@ -424,6 +431,32 @@ def main():
         grouped[prompt_group_key(item["class_id"], item["failure_type"], args.prompt_scope)].append(item)
     if not grouped:
         raise RuntimeError("Empty failure pool.")
+    if args.prepare_workers:
+        if args.alignment_enabled:
+            detector = create_detector(
+                family=args.model_family, weights=args.weights, source_root=args.ultralytics_root,
+                device=accelerator.device, image_size=args.detector_image_size,
+                iou=args.detector_iou, max_det=args.detector_max_det,
+            )
+            detector.validate_dataset_names(dataset.class_names)
+            load_or_compute_guide_gradients(
+                detector, args.guide_images, args.guide_labels, args.alignment_cache_dir,
+                args.dataset_yaml, full_dataset.class_names, full_dataset.class_mapping,
+                args.alignment_image_size, args.alignment_scaleup, args.guide_batch_size,
+                args.guide_workers, use_cache=True, max_images=args.max_guide_images,
+            )
+        output = Path(args.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "worker_classes.json").write_text(
+            json.dumps(sorted({int(item["class_id"]) for item in failures})), encoding="utf-8"
+        )
+        return
+    if args.train_class_ids is not None:
+        assigned = {int(value) for value in args.train_class_ids.split(",")}
+        grouped = {group: items for group, items in grouped.items()
+                   if int(items[0]["class_id"]) in assigned}
+        if not grouped:
+            raise RuntimeError("No failures for this Prompt worker's classes")
     current_groups = {group: placeholder_tokens(group, args.num_new_tokens) for group in sorted(grouped)}
     resume_source = None
     resume_groups: dict[str, list[str]] = {}
@@ -547,6 +580,7 @@ def main():
             workers=args.guide_workers,
             use_cache=args.alignment_cache,
             max_images=args.max_guide_images,
+            require_cache=args.require_guide_cache,
         )
         if args.initial_step and previous_metadata_path.is_file():
             previous_hash = previous_alignment.get("guide_metadata_hash")
@@ -592,6 +626,12 @@ def main():
         eps=args.adam_epsilon,
     )
     lr_scheduler = get_scheduler(args.lr_scheduler, optimizer=optimizer, num_warmup_steps=args.lr_warmup_steps, num_training_steps=args.max_train_steps)
+    if args.initial_step and previous_metadata_path.is_file():
+        scheduler_state = previous_metadata.get("lr_scheduler_state")
+        if scheduler_state is not None:
+            lr_scheduler.load_state_dict(scheduler_state)
+            for param_group, learning_rate in zip(optimizer.param_groups, lr_scheduler.get_last_lr()):
+                param_group["lr"] = learning_rate
     text_encoder, optimizer, lr_scheduler = accelerator.prepare(text_encoder, optimizer, lr_scheduler)
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
@@ -777,6 +817,7 @@ def main():
                             f"Detector parameter {index} changed during Prompt optimization"
                         )
             metadata = {"prompt_scope": args.prompt_scope, "num_new_tokens": args.num_new_tokens,
+                        "lr_scheduler_state": lr_scheduler.state_dict(),
                         "init_mode": args.init_mode,
                         "resume_token": resume_source,
                         "resume_mode": args.resume_mode,

@@ -453,6 +453,7 @@ def load_or_compute_guide_gradients(
     workers: int,
     use_cache: bool = True,
     max_images: int | None = None,
+    require_cache: bool = False,
 ) -> tuple[list[torch.Tensor], dict[str, Any]]:
     dataset = GuideDetectionDataset(
         image_directory,
@@ -493,6 +494,8 @@ def load_or_compute_guide_gradients(
                 stats = dict(payload.get("statistics", {}))
                 cache_hit = True
     if gradients is None:
+        if require_cache:
+            raise RuntimeError(f"Prepared Guide cache is missing or incompatible: {cache_path}")
         gradients, stats = compute_guide_gradients(
             detector, dataset, batch_size=batch_size, workers=workers
         )
@@ -513,7 +516,8 @@ def load_or_compute_guide_gradients(
         "cache_hit": cache_hit,
         "statistics": stats,
     }
-    _atomic_json_save(metadata_path, sidecar)
+    if not require_cache:
+        _atomic_json_save(metadata_path, sidecar)
     device_gradients = [value.to(detector.device, dtype=torch.float32) for value in gradients]
     return device_gradients, sidecar
 

@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 
-SUPPORTED_ULTRALYTICS_VERSION = "8.4.115"
+SUPPORTED_ULTRALYTICS_VERSION = "8.4.129"
 SUPPORTED_FAMILIES = {"yolo", "rtdetr"}
 
 
@@ -239,8 +239,14 @@ class UltralyticsDetector:
     def predict(self, image, conf: float = 0.001) -> list[dict[str, Any]]:
         """Run public Ultralytics inference and return the legacy-compatible dictionary schema."""
 
+        return self.predict_batch([image], conf=conf)[0]
+
+    def predict_batch(self, images, conf: float = 0.001) -> list[list[dict[str, Any]]]:
+        """Return one prediction list per input image, preserving input order."""
+        if not images:
+            return []
         results = self.facade.predict(
-            source=image,
+            source=images,
             conf=float(conf),
             iou=self.iou,
             imgsz=self.image_size,
@@ -248,9 +254,13 @@ class UltralyticsDetector:
             max_det=self.max_det,
             verbose=False,
         )
-        if not results:
-            return []
-        boxes = results[0].boxes
+        if len(results) != len(images):
+            raise RuntimeError("Detector returned a different number of results than input images")
+        return [self._prediction_dicts(result) for result in results]
+
+    @staticmethod
+    def _prediction_dicts(result) -> list[dict[str, Any]]:
+        boxes = result.boxes
         if boxes is None or len(boxes) == 0:
             return []
         xyxy = boxes.xyxy.detach().cpu()

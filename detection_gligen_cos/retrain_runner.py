@@ -16,13 +16,17 @@ import copy
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .generation_manifest import progress_count, recover_manifest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +46,46 @@ def utc_now() -> str:
 def resolved(value: str | Path, root: Path = REPO_ROOT) -> Path:
     path = Path(value).expanduser()
     return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def normalize_physical_devices(value: Any, option: str) -> str:
+    """Normalize physical GPU IDs while preserving their configured order."""
+    if isinstance(value, (list, tuple)):
+        devices = [str(item).strip() for item in value]
+    else:
+        text = str(value).strip()
+        if text.lower() == "cpu":
+            return "cpu"
+        devices = [item.strip() for item in text.split(",")]
+
+    if not devices or any(not item.isdigit() for item in devices):
+        raise ValueError(
+            f"{option} must be one or more physical GPU indices "
+            '(for example "6" or "6,7"), or cpu'
+        )
+    normalized = [str(int(item)) for item in devices]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{option} contains duplicate GPU indices: {value!r}")
+    return ",".join(normalized)
+
+
+def normalize_retrain_devices(value: Any) -> str:
+    """Normalize physical retraining GPU IDs."""
+
+    return normalize_physical_devices(value, "retrain.device")
+
+
+def normalize_generation_devices(value: Any) -> str:
+    """Normalize physical generation GPU IDs."""
+
+    return normalize_physical_devices(value, "generation.devices")
+
+
+def logical_retrain_devices(physical_devices: str) -> str:
+    """Map CUDA_VISIBLE_DEVICES entries to the logical IDs expected by Ultralytics."""
+    if physical_devices.lower() == "cpu":
+        return "cpu"
+    return ",".join(str(index) for index, _ in enumerate(physical_devices.split(",")))
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -170,6 +214,14 @@ def normalize_effective_config(
     model_cfg.setdefault("image_size", 640)
     model_cfg.setdefault("inference", {"iou": 0.7, "max_det": 300})
 
+    mining = cfg.setdefault("mining", {})
+    mining["devices"] = normalize_physical_devices(
+        mining.get("devices", cfg["device"]), "mining.devices"
+    )
+    mining["batch_size"] = int(mining.get("batch_size", 1))
+    if mining["batch_size"] <= 0:
+        raise ValueError("mining.batch_size must be positive")
+
     dataset_root, _ = dataset_root_from_yaml(Path(cfg["dataset"]))
     data_cfg = cfg.setdefault("data", {})
     data_cfg.update(
@@ -184,8 +236,14 @@ def normalize_effective_config(
     )
 
     generation = cfg.setdefault("generation", {})
-    generation["device"] = "cpu" if cfg["device"].lower() == "cpu" else "cuda:0"
+    generation["devices"] = normalize_generation_devices(
+        generation.get("devices", cfg["device"])
+    )
+    generation["device"] = "cpu" if generation["devices"] == "cpu" else "cuda:0"
     generation["max_images"] = cfg["syn_sample"]
+    generation["batch_size"] = int(generation.get("batch_size", 1))
+    if generation["batch_size"] <= 0:
+        raise ValueError("generation.batch_size must be positive")
     generation.setdefault("local_files_only", cfg.get("stable_diffusion", {}).get("local_files_only", True))
     generation.setdefault("variant", None)
     generation.setdefault("include_class_name", None)
@@ -211,6 +269,9 @@ def normalize_effective_config(
     generation.setdefault("save_visualization", False)
 
     optimization = cfg.setdefault("prompt_optimization", {})
+    optimization["devices"] = normalize_physical_devices(
+        optimization.get("devices", cfg["device"]), "prompt_optimization.devices"
+    )
     gradient = optimization.setdefault("gradient_alignment", {})
     gradient.setdefault("enabled", True)
     gradient.setdefault("guideset_yaml", cfg.get("gradient_alignment", {}).get("guideset_yaml"))
@@ -241,6 +302,7 @@ def normalize_effective_config(
     retrain.setdefault("epochs", 500)
     retrain.setdefault("image_size", 640)
     retrain.setdefault("batch_size", 156)
+    retrain["device"] = normalize_retrain_devices(retrain.get("device", cfg["device"]))
     retrain.setdefault("project", "yolo26n_COCO_subset")
     retrain.setdefault("patience", 10)
     retrain.setdefault("workers", 24)
@@ -423,7 +485,7 @@ def mark_stage_complete(
 
 
 def subprocess_environment(
-    cfg: dict[str, Any], quiet_stage_logs: bool
+    cfg: dict[str, Any], quiet_stage_logs: bool, physical_devices: str | None = None
 ) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -431,8 +493,13 @@ def subprocess_environment(
     if cfg.get("stable_diffusion", {}).get("local_files_only", True):
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
-    if str(cfg["device"]).lower() != "cpu":
-        env["CUDA_VISIBLE_DEVICES"] = str(cfg["device"])
+    selected_devices = str(
+        cfg["device"] if physical_devices is None else physical_devices
+    )
+    if selected_devices.lower() == "cpu":
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = selected_devices
     if quiet_stage_logs:
         env["DETECTION_GLIGEN_SDEDIT_FILE_LOG_ONLY"] = "1"
     else:
@@ -441,12 +508,15 @@ def subprocess_environment(
 
 
 def run_command(
-    command: list[str], cfg: dict[str, Any], quiet_stage_logs: bool = True
+    command: list[str],
+    cfg: dict[str, Any],
+    quiet_stage_logs: bool = True,
+    physical_devices: str | None = None,
 ) -> None:
     subprocess.run(
         command,
         cwd=REPO_ROOT,
-        env=subprocess_environment(cfg, quiet_stage_logs),
+        env=subprocess_environment(cfg, quiet_stage_logs, physical_devices),
         check=True,
     )
 
@@ -561,11 +631,18 @@ def run_mine(
         state, state_path, round_idx, "mine", output=str(output), model=str(model)
     )
     mining = cfg["mining"]
+    mining_devices = normalize_physical_devices(
+        mining.get("devices", cfg["device"]), "mining.devices"
+    )
     inference = cfg["model"].get("inference", {})
     command = [
         sys.executable,
         "-m",
         "detection_gligen_cos.mine_failures_ultralytics",
+        "--devices",
+        mining_devices,
+        "--batch-size",
+        str(mining.get("batch_size", 1)),
         "--annotations",
         str(paths["train_annotations"]),
         "--images",
@@ -606,7 +683,7 @@ def run_mine(
     if mining.get("min_failures_per_class") is not None:
         command += ["--min-failures-per-class", str(mining["min_failures_per_class"])]
     print(f"round {round_idx}, begin to mine", flush=True)
-    run_command(command, cfg)
+    run_command(command, cfg, physical_devices=mining_devices)
     require_file(output, "Failure mining output")
     failure_count = len(
         json.loads(output.read_text(encoding="utf-8")).get("failures", [])
@@ -672,7 +749,10 @@ def run_optimize(
     initial_step = 0
     if record["status"] == "running":
         resume_token, initial_step = latest_prompt_checkpoint(prompts)
-    elif optimization.get("resume_from_previous", False) and round_idx > 1:
+        # A merged tensor is not committed until its metadata has been written.
+        if (prompts / "_workers").is_dir() and not (prompts / "object_prompts.json").is_file():
+            resume_token, initial_step = None, 0
+    if resume_token is None and optimization.get("resume_from_previous", False) and round_idx > 1:
         resume_token, _ = latest_prompt_checkpoint(
             Path(cfg["workspace"]) / f"round_{round_idx - 1}" / "prompts"
         )
@@ -779,6 +859,10 @@ def run_optimize(
         str(initial_step),
         "--learning-rate",
         str(optimization["learning_rate"]),
+        "--lr-scheduler",
+        str(optimization.get("lr_scheduler", "constant")),
+        "--lr-warmup-steps",
+        str(optimization.get("lr_warmup_steps", 0)),
         "--strength",
         str(optimization["strength"]),
         "--num-inference-steps",
@@ -830,7 +914,14 @@ def run_optimize(
         command.append("--local-files-only")
 
     print(f"round {round_idx}, begin to optimize prompts", flush=True)
-    run_command(command, cfg)
+    prompt_devices = normalize_physical_devices(
+        optimization.get("devices", cfg["device"]), "prompt_optimization.devices"
+    )
+    if prompt_devices != "cpu" and len(prompt_devices.split(",")) > 1:
+        from .prompt_workers import run_prompt_workers
+        run_prompt_workers(command, cfg, prompts, prompt_devices.split(","), initial_step)
+    else:
+        run_command(command, cfg, physical_devices=prompt_devices)
     latest, completed_steps = latest_prompt_checkpoint(prompts)
     if latest is None or completed_steps < maximum_steps:
         raise RuntimeError(
@@ -858,44 +949,123 @@ def manifest_count(path: Path) -> int:
     return len(payload)
 
 
-def run_generate(
-    state: dict[str, Any], state_path: Path, cfg: dict[str, Any], round_idx: int
-) -> None:
-    record = round_state(state, round_idx)["generate"]
-    if record["status"] == "completed":
-        return
-    paths = data_paths(cfg)
-    round_dir = Path(cfg["workspace"]) / f"round_{round_idx}"
-    prompts = round_dir / "prompts"
-    output = round_dir / "synthetic"
-    manifest = output / "manifest.json"
-    if record["status"] == "pending" and output.exists() and any(output.iterdir()):
-        raise FileExistsError(
-            f"Fresh generation output is not empty; resume requires the state JSON: {output}"
-        )
-    generated = manifest_count(manifest)
-    if generated >= int(cfg["syn_sample"]):
-        mark_stage_complete(
-            state,
-            state_path,
-            round_idx,
-            "generate",
-            output=str(output),
-            manifest=str(manifest),
-            generated_samples=generated,
-            generation_target=int(cfg["syn_sample"]),
-        )
-        print(f"round {round_idx}, have generated {generated} samples.", flush=True)
-        return
-    mark_stage_running(
-        state,
-        state_path,
-        round_idx,
-        "generate",
-        output=str(output),
-        generated_samples=generated,
-        generation_target=int(cfg["syn_sample"]),
+def generation_shard_target(total: int, shard_index: int, num_shards: int) -> int:
+    quotient, remainder = divmod(total, num_shards)
+    return quotient + int(shard_index < remainder)
+
+
+def write_json_list_atomic(path: Path, payload: list[Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    os.replace(temporary, path)
+
+
+def materialize_generation_file(source: Path, destination: Path) -> None:
+    require_file(source, "Generation shard file")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if destination.is_file() and destination.stat().st_size == source.stat().st_size:
+            return
+        raise FileExistsError(
+            f"Merged generation file already exists with different contents: {destination}"
+        )
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def merge_generation_shards(
+    output: Path, shard_outputs: list[Path], target: int
+) -> list[dict[str, Any]]:
+    """Validate worker outputs and atomically publish one canonical synthetic set."""
+
+    records: list[dict[str, Any]] = []
+    image_ids: set[int] = set()
+    file_names: set[str] = set()
+    shard_count = len(shard_outputs)
+    for shard_index, shard_output in enumerate(shard_outputs):
+        manifest_path = shard_output / "manifest.json"
+        require_file(manifest_path, f"Generation worker {shard_index} manifest")
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError(f"Generation manifest must be a list: {manifest_path}")
+        expected = generation_shard_target(target, shard_index, shard_count)
+        if len(payload) != expected:
+            raise RuntimeError(
+                f"Generation worker {shard_index} produced {len(payload)}/{expected} samples"
+            )
+        for source_item in payload:
+            item = dict(source_item)
+            image_id = int(item["image_id"])
+            file_name = Path(str(item["file_name"])).name
+            if image_id in image_ids or file_name in file_names:
+                raise RuntimeError(
+                    f"Duplicate generated sample while merging shards: image_id={image_id} file={file_name}"
+                )
+            image_ids.add(image_id)
+            file_names.add(file_name)
+            result_relative = Path(str(item.get("result_file", f"images/{file_name}")))
+            source_image = (shard_output / result_relative).resolve()
+            try:
+                source_image.relative_to(shard_output.resolve())
+            except ValueError as exc:
+                raise ValueError(
+                    f"Generation worker result escapes its shard directory: {result_relative}"
+                ) from exc
+            source_label = shard_output / "labels" / Path(file_name).with_suffix(".txt")
+            materialize_generation_file(source_image, output / "images" / file_name)
+            materialize_generation_file(
+                source_label, output / "labels" / Path(file_name).with_suffix(".txt")
+            )
+            for key in ("original_overlay_file", "result_overlay_file"):
+                if item.get(key):
+                    relative = Path(str(item[key]))
+                    materialize_generation_file(
+                        shard_output / relative, output / relative
+                    )
+            item["result_file"] = f"images/{file_name}"
+            item["generation_shard"] = shard_index
+            records.append(item)
+
+    if len(records) != target:
+        raise RuntimeError(
+            f"Merged generation count is {len(records)}, expected {target}"
+        )
+    expected_images = {str(output / "images" / name) for name in file_names}
+    unexpected_images = sorted(
+        str(path)
+        for path in (output / "images").iterdir()
+        if path.is_file() and str(path) not in expected_images
+    )
+    if unexpected_images:
+        raise RuntimeError(
+            f"Canonical generation directory contains stale images: {unexpected_images[:5]}"
+        )
+    records.sort(key=lambda item: int(item["image_id"]))
+    write_json_list_atomic(output / "manifest.json", records)
+    write_json_list_atomic(
+        output / "selected_images.json",
+        [str((output / item["result_file"]).resolve()) for item in records],
+    )
+    return records
+
+
+def build_generation_command(
+    cfg: dict[str, Any],
+    paths: dict[str, Path],
+    prompts: Path,
+    output: Path,
+    round_idx: int,
+    *,
+    state_path: Path | None,
+    shard_index: int = 0,
+    num_shards: int = 1,
+    resume: bool = False,
+) -> list[str]:
     generation = cfg["generation"]
     generation_model = generation.get("model") or generation.get("gligen_model")
     command = [
@@ -904,6 +1074,8 @@ def run_generate(
         "detection_gligen_cos.generate_gligen_sdedit_examples",
         "--pretrained-model-name-or-path",
         str(generation_model),
+        "--batch-size",
+        str(generation.get("batch_size", 1)),
         "--annotations",
         str(paths["train_annotations"]),
         "--images",
@@ -940,10 +1112,17 @@ def run_generate(
         str(generation["device"]),
         "--seed",
         str(int(cfg["seed"]) + round_idx),
-        "--state-json",
-        str(state_path),
     ] + class_subset_args(cfg)
-    if generated:
+    if state_path is not None:
+        command += ["--state-json", str(state_path)]
+    if num_shards > 1:
+        command += [
+            "--shard-index",
+            str(shard_index),
+            "--num-shards",
+            str(num_shards),
+        ]
+    if resume:
         command.append("--resume")
     if generation.get("variant") is not None:
         command += ["--variant", str(generation["variant"])]
@@ -964,15 +1143,218 @@ def run_generate(
         command.append("--save-visualization")
     if generation.get("local_files_only", True):
         command.append("--local-files-only")
+    return command
 
-    print(f"round {round_idx}, begin to generate samples", flush=True)
-    run_command(command, cfg)
-    state.clear()
-    state.update(read_json(state_path))
+
+def run_generation_workers(
+    workers: list[dict[str, Any]],
+    state: dict[str, Any],
+    state_path: Path,
+    cfg: dict[str, Any],
+    round_idx: int,
+    target: int,
+) -> None:
+    """Run one terminal-attached GLIGEN process per physical GPU and monitor manifests."""
+
+    running: list[dict[str, Any]] = []
+    try:
+        for worker in workers:
+            worker["output"].mkdir(parents=True, exist_ok=True)
+            print(
+                f"generation worker {worker['shard_index']} start: physical_device={worker['device']} "
+                f"target={worker['target']}",
+                flush=True,
+            )
+            process = subprocess.Popen(
+                worker["command"],
+                cwd=REPO_ROOT,
+                env=subprocess_environment(
+                    cfg, quiet_stage_logs=True, physical_devices=worker["device"]
+                ),
+            )
+            running.append({**worker, "process": process})
+
+        previous_snapshot: tuple[tuple[int, int | None], ...] | None = None
+        while True:
+            counts = tuple(
+                progress_count(worker["output"])
+                for worker in running
+            )
+            codes = tuple(worker["process"].poll() for worker in running)
+            snapshot = tuple(zip(counts, codes))
+            if snapshot != previous_snapshot:
+                generate_record = round_state(state, round_idx)["generate"]
+                worker_state = generate_record.setdefault("workers", {})
+                for worker, count, code in zip(running, counts, codes):
+                    worker_state[str(worker["shard_index"])] = {
+                        "device": str(worker["device"]),
+                        "output": str(worker["output"]),
+                        "generated_samples": count,
+                        "generation_target": int(worker["target"]),
+                        "status": "running" if code is None else ("completed" if code == 0 else "failed"),
+                    }
+                generated = sum(
+                    int(details["generated_samples"])
+                    for details in worker_state.values()
+                )
+                generate_record["generated_samples"] = generated
+                state["current"] = {
+                    "round": round_idx,
+                    "stage": "generate",
+                    "status": "running",
+                    "generated_samples": generated,
+                    "generation_target": target,
+                }
+                write_json_atomic(state_path, state)
+                previous_snapshot = snapshot
+            if all(code is not None for code in codes):
+                break
+            time.sleep(1)
+    finally:
+        for worker in running:
+            if worker["process"].poll() is None:
+                worker["process"].terminate()
+        for worker in running:
+            worker["process"].wait()
+
+    failures = [worker for worker in running if worker["process"].returncode]
+    if failures:
+        details = ", ".join(
+            f"worker={worker['shard_index']} device={worker['device']} exit={worker['process'].returncode}"
+            for worker in failures
+        )
+        raise RuntimeError(f"Parallel generation failed: {details}")
+
+
+def run_generate(
+    state: dict[str, Any], state_path: Path, cfg: dict[str, Any], round_idx: int
+) -> None:
+    record = round_state(state, round_idx)["generate"]
+    if record["status"] == "completed":
+        return
+    paths = data_paths(cfg)
+    round_dir = Path(cfg["workspace"]) / f"round_{round_idx}"
+    prompts = round_dir / "prompts"
+    output = round_dir / "synthetic"
+    manifest = output / "manifest.json"
+    if record["status"] == "pending" and output.exists() and any(output.iterdir()):
+        raise FileExistsError(
+            f"Fresh generation output is not empty; resume requires the state JSON: {output}"
+        )
+    target = int(cfg["syn_sample"])
+    recover_manifest(output)
     generated = manifest_count(manifest)
-    if generated < int(cfg["syn_sample"]):
+    if generated >= target:
+        mark_stage_complete(
+            state,
+            state_path,
+            round_idx,
+            "generate",
+            output=str(output),
+            manifest=str(manifest),
+            generated_samples=generated,
+            generation_target=target,
+        )
+        print(f"round {round_idx}, have generated {generated} samples.", flush=True)
+        return
+    generation = cfg["generation"]
+    devices_value = normalize_generation_devices(
+        generation.get("devices", cfg["device"])
+    )
+    devices = [devices_value] if devices_value == "cpu" else devices_value.split(",")
+    print(f"round {round_idx}, begin to generate samples", flush=True)
+    if len(devices) == 1:
+        mark_stage_running(
+            state,
+            state_path,
+            round_idx,
+            "generate",
+            output=str(output),
+            generated_samples=generated,
+            generation_target=target,
+        )
+        command = build_generation_command(
+            cfg,
+            paths,
+            prompts,
+            output,
+            round_idx,
+            state_path=state_path,
+            resume=bool(generated),
+        )
+        run_command(command, cfg, physical_devices=devices[0])
+        state.clear()
+        state.update(read_json(state_path))
+    else:
+        shard_root = output / "_shards"
+        shard_outputs = [
+            shard_root / f"worker_{index}" for index in range(len(devices))
+        ]
+        workers = []
+        worker_state = {}
+        for shard_index, (device, shard_output) in enumerate(
+            zip(devices, shard_outputs)
+        ):
+            worker_target = generation_shard_target(
+                target, shard_index, len(devices)
+            )
+            recover_manifest(shard_output)
+            worker_generated = manifest_count(shard_output / "manifest.json")
+            if worker_generated > worker_target:
+                raise RuntimeError(
+                    f"Generation worker {shard_index} has {worker_generated} samples, "
+                    f"exceeding its target {worker_target}"
+                )
+            worker_state[str(shard_index)] = {
+                "device": device,
+                "output": str(shard_output),
+                "generated_samples": worker_generated,
+                "generation_target": worker_target,
+                "status": "completed" if worker_generated == worker_target else "pending",
+            }
+            if worker_generated < worker_target:
+                workers.append(
+                    {
+                        "shard_index": shard_index,
+                        "device": device,
+                        "output": shard_output,
+                        "target": worker_target,
+                        "command": build_generation_command(
+                            cfg,
+                            paths,
+                            prompts,
+                            shard_output,
+                            round_idx,
+                            state_path=None,
+                            shard_index=shard_index,
+                            num_shards=len(devices),
+                            resume=bool(worker_generated),
+                        ),
+                    }
+                )
+        generated = sum(
+            int(details["generated_samples"]) for details in worker_state.values()
+        )
+        mark_stage_running(
+            state,
+            state_path,
+            round_idx,
+            "generate",
+            output=str(output),
+            generated_samples=generated,
+            generation_target=target,
+            workers=worker_state,
+        )
+        if workers:
+            run_generation_workers(
+                workers, state, state_path, cfg, round_idx, target
+            )
+        merge_generation_shards(output, shard_outputs, target)
+
+    generated = manifest_count(manifest)
+    if generated < target:
         raise RuntimeError(
-            f"Round {round_idx} generated {generated}/{cfg['syn_sample']} requested samples; candidate images were exhausted"
+            f"Round {round_idx} generated {generated}/{target} requested samples; candidate images were exhausted"
         )
     mark_stage_complete(
         state,
@@ -982,7 +1364,7 @@ def run_generate(
         output=str(output),
         manifest=str(manifest),
         generated_samples=generated,
-        generation_target=int(cfg["syn_sample"]),
+        generation_target=target,
     )
     print(f"round {round_idx}, have generated {generated} samples.", flush=True)
 
@@ -1030,6 +1412,10 @@ def run_retrain(
     name, run_dir = retrain_run_dir(cfg, round_idx)
     last = run_dir / "weights/last.pt"
     best = run_dir / "weights/best.pt"
+    retrain_devices = normalize_retrain_devices(
+        cfg.get("retrain", {}).get("device", cfg["device"])
+    )
+    ultralytics_devices = logical_retrain_devices(retrain_devices)
     retrain_record = mark_stage_running(
         state,
         state_path,
@@ -1040,6 +1426,8 @@ def run_retrain(
         run_dir=str(run_dir),
         last=str(last),
         best=str(best),
+        physical_devices=retrain_devices,
+        ultralytics_devices=ultralytics_devices,
         resuming=last.is_file(),
         epoch=int(retrain_record.get("epoch", 0)),
     )
@@ -1053,7 +1441,12 @@ def run_retrain(
         "--retrain-round",
         str(round_idx),
     ]
-    run_command(command, cfg, quiet_stage_logs=False)
+    run_command(
+        command,
+        cfg,
+        quiet_stage_logs=False,
+        physical_devices=retrain_devices,
+    )
     state.clear()
     state.update(read_json(state_path))
     require_file(best, f"Retrained best checkpoint for {name}")
@@ -1095,6 +1488,9 @@ def internal_retrain(args: argparse.Namespace) -> None:
     run_dir = Path(retrain_record["run_dir"])
     last = run_dir / "weights/last.pt"
     best = run_dir / "weights/best.pt"
+    retrain = cfg["retrain"]
+    retrain_devices = normalize_retrain_devices(retrain.get("device", cfg["device"]))
+    ultralytics_devices = logical_retrain_devices(retrain_devices)
 
     ultralytics_root = Path(cfg["model"]["ultralytics_root"])
     root_text = str(ultralytics_root)
@@ -1122,7 +1518,7 @@ def internal_retrain(args: argparse.Namespace) -> None:
     model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
     if last.is_file():
         try:
-            model.train(resume=True)
+            model.train(resume=True, device=ultralytics_devices)
         except AssertionError as exc:
             message = str(exc)
             if (
@@ -1134,12 +1530,11 @@ def internal_retrain(args: argparse.Namespace) -> None:
             raise
         return
 
-    retrain = cfg["retrain"]
     model.train(
         data=str(data_yaml),
         epochs=int(retrain["epochs"]),
         imgsz=int(retrain["image_size"]),
-        device=str(cfg["model"]["device"]),
+        device=ultralytics_devices,
         batch=int(retrain["batch_size"]),
         project=str(project_root(cfg)),
         name=str(retrain_record["name"]),

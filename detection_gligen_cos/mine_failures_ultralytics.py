@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
+import os
 import random
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +15,63 @@ from tqdm.auto import tqdm
 
 from .common import CocoMini, FailureSample, parse_class_subset, save_failures, setup_logger, subset_label
 from .modeling import create_detector
+
+
+def _init_worker(options, class_names, physical_device):
+    global _worker_detector
+    if physical_device is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "" if physical_device == "cpu" else physical_device
+        options = {**options, "device": "cpu" if physical_device == "cpu" else "0"}
+    _worker_detector = create_detector(**options)
+    _worker_detector.validate_dataset_names(class_names)
+
+
+def _worker_metadata():
+    return {
+        "family": _worker_detector.family,
+        "version": _worker_detector.version,
+        "weights": str(_worker_detector.weights),
+        "supports_top2_gap": _worker_detector.supports_top2_gap,
+    }
+
+
+def _predict_paths(paths, conf):
+    images = []
+    for path in paths:
+        with Image.open(path) as image:
+            images.append(image.convert("RGB"))
+    return _worker_detector.predict_batch(images, conf=conf)
+
+
+def mining_predictions(args, class_names, images):
+    """Yield metadata, then ordered predictions with at most one batch per GPU in flight."""
+    options = dict(family=args.model_family, weights=args.weights,
+                   source_root=args.ultralytics_root, device=args.device,
+                   image_size=args.image_size, iou=args.iou, max_det=args.max_det)
+    devices = args.devices.split(",") if args.devices else [None]
+    pools = []
+    try:
+        for device in devices:
+            pools.append(ProcessPoolExecutor(
+                max_workers=1, mp_context=multiprocessing.get_context("spawn"),
+                initializer=_init_worker, initargs=(options, class_names, device),
+            ))
+        metadata_jobs = [pool.submit(_worker_metadata) for pool in pools]
+        metadata = [job.result() for job in metadata_jobs]
+        yield metadata[0]
+        window = args.batch_size * len(pools)
+        for start in range(0, len(images), window):
+            jobs = []
+            for offset, pool in enumerate(pools):
+                batch_start = start + offset * args.batch_size
+                batch = images[batch_start:batch_start + args.batch_size]
+                if batch:
+                    jobs.append(pool.submit(_predict_paths, [str(item[1]) for item in batch], args.conf))
+            for job in jobs:
+                yield from job.result()
+    finally:
+        for pool in pools:
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def xywh_iou(box, boxes):
@@ -81,6 +142,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--state", required=True)
     parser.add_argument("--device", default="0")
+    parser.add_argument("--devices", default=None, help="Physical GPU IDs, e.g. 0,1,2,3, or cpu; overrides --device.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Inference batch size per worker.")
     parser.add_argument("--image-size", type=int, default=640)
     parser.add_argument("--iou", type=float, default=0.7)
     parser.add_argument("--max-det", type=int, default=300)
@@ -95,6 +158,11 @@ def main():
     parser.add_argument("--classes-subset", type=int, default=None)
     parser.add_argument("--class-ids", default=None)
     args = parser.parse_args()
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.devices is not None:
+        from .retrain_runner import normalize_physical_devices
+        args.devices = normalize_physical_devices(args.devices, "--devices")
 
     logger = setup_logger(Path(args.output).parent)
     class_subset = parse_class_subset(args.classes_subset is not None or args.class_ids is not None, args.classes_subset, args.class_ids)
@@ -117,29 +185,6 @@ def main():
         subset_label(class_subset),
         dataset.class_mapping,
     )
-    detector = create_detector(
-        family=args.model_family,
-        weights=args.weights,
-        source_root=args.ultralytics_root,
-        device=args.device,
-        image_size=args.image_size,
-        iou=args.iou,
-        max_det=args.max_det,
-    )
-    detector.validate_dataset_names(dataset.class_names)
-    logger.info(
-        "detector loaded: backend=ultralytics family=%s version=%s weights=%s device=%s image_size=%d",
-        detector.family,
-        detector.version,
-        detector.weights,
-        detector.device,
-        detector.image_size,
-    )
-    if not detector.supports_top2_gap:
-        logger.warning(
-            "top1_top2_close mining is disabled because public Ultralytics detection results do not expose "
-            "complete per-box class scores"
-        )
     state_file = Path(args.state)
     forgotten = json.loads(state_file.read_text()) if state_file.exists() else {}
     cfg = vars(args)
@@ -166,25 +211,32 @@ def main():
 
     logger.info("failure mining start: images=%d weights=%s", len(images), args.weights)
     stop_reason = "dataset_exhausted"
-    for idx, (image_id, path, anns) in enumerate(tqdm(images, desc="failure mining"), start=1):
-        preds = detector.predict(Image.open(path).convert("RGB"), conf=args.conf)
-        image_failures = classify(image_id, anns, preds, cfg, forgotten)
-        failures.extend(image_failures)
-        if class_aware:
-            for failure in image_failures:
-                class_id = int(failure.class_id)
-                if class_id in failure_counts:
-                    failure_counts[class_id] += 1
-        if idx == 1 or idx % 250 == 0 or idx == len(images):
-            logger.info("failure mining progress: %d/%d failures=%d", idx, len(images), len(failures))
+    with closing(mining_predictions(args, dataset.class_names, images)) as predictions:
+        metadata = next(predictions)
+        logger.info("detector workers loaded: family=%s version=%s weights=%s devices=%s batch_size=%d",
+                    metadata["family"], metadata["version"], metadata["weights"],
+                    args.devices or args.device, args.batch_size)
+        if not metadata["supports_top2_gap"]:
+            logger.warning("top1_top2_close mining is disabled: public detection results do not expose complete class scores")
+        for idx, (image_id, path, anns) in enumerate(tqdm(images, desc="failure mining"), start=1):
+            preds = next(predictions)
+            image_failures = classify(image_id, anns, preds, cfg, forgotten)
+            failures.extend(image_failures)
             if class_aware:
-                logger.info("class-aware mining progress: %d/%d failures_by_class=%s",
-                            idx, len(images), format_failure_counts(failure_counts))
-        if class_aware and failure_counts and all(count >= args.min_failures_per_class for count in failure_counts.values()):
-            stop_reason = "min_failures_per_class_reached"
-            logger.info("class-aware mining early stop: reason=%s processed=%d/%d failures_by_class=%s",
-                        stop_reason, idx, len(images), format_failure_counts(failure_counts))
-            break
+                for failure in image_failures:
+                    class_id = int(failure.class_id)
+                    if class_id in failure_counts:
+                        failure_counts[class_id] += 1
+            if idx == 1 or idx % 250 == 0 or idx == len(images):
+                logger.info("failure mining progress: %d/%d failures=%d", idx, len(images), len(failures))
+                if class_aware:
+                    logger.info("class-aware mining progress: %d/%d failures_by_class=%s",
+                                idx, len(images), format_failure_counts(failure_counts))
+            if class_aware and failure_counts and all(count >= args.min_failures_per_class for count in failure_counts.values()):
+                stop_reason = "min_failures_per_class_reached"
+                logger.info("class-aware mining early stop: reason=%s processed=%d/%d failures_by_class=%s",
+                            stop_reason, idx, len(images), format_failure_counts(failure_counts))
+                break
     if class_aware and stop_reason != "min_failures_per_class_reached":
         if args.max_images is not None and len(images) < len(all_images):
             stop_reason = "max_images_reached"
@@ -201,10 +253,10 @@ def main():
         {
             "source": "real_only",
             "model_backend": "ultralytics",
-            "model_family": detector.family,
+            "model_family": metadata["family"],
             "model_task": "detect",
-            "ultralytics_version": detector.version,
-            "weights": str(detector.weights),
+            "ultralytics_version": metadata["version"],
+            "weights": metadata["weights"],
             "dataset_yaml": str(dataset.dataset_yaml) if dataset.dataset_yaml is not None else None,
             "class_names": dataset.class_names,
             "class_mapping": dataset.class_mapping,
@@ -219,4 +271,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
